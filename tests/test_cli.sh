@@ -74,6 +74,23 @@ kill "$hg"; sleep 2
 check "SIGTERM stops the job" "$(state "$kid")" ""
 check "pidfile removed" "$([ -e /tmp/thermo-test.pid ] && echo yes || echo no)" "no"
 
+# a hot machine freezes the job on its own (5 °C means "always hot")
+nohup $T -i 1 -p 5 -r 4 -f /tmp/thermo-hot.pid -- sleep 30 >/dev/null 2>&1 </dev/null &
+sleep 4
+hg=$(cat /tmp/thermo-hot.pid)
+kid=$(pgrep -P "$hg" | head -1)
+check "freezes when hot" "$(state "$kid")" "T"
+kill "$hg"; sleep 2
+check "thawed on the way out" "$(state "$kid")" ""
+
+# --ungated must never freeze: with no sensor there is nothing to fail safe to
+nohup $T -u -s powermetrics -i 1 -f /tmp/thermo-ung.pid -- sleep 20 >/dev/null 2>&1 </dev/null &
+sleep 5
+hg=$(cat /tmp/thermo-ung.pid)
+kid=$(pgrep -P "$hg" | head -1)
+check "ungated keeps running" "$(state "$kid")" "S"
+kill "$hg"
+
 # stuck hot: give up, stop the job, exit 75
 $T -i 1 -p 5 -r 4 -w 0.05 -- sleep 30 >/dev/null 2>&1
 check "--max-wait exit code" "$?" "75"

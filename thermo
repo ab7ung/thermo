@@ -684,17 +684,20 @@ exit codes: the child's, or 75 stuck hot, 78 no sensor, 143 terminated.""",
         with open(args.pidfile, "w") as fh:
             fh.write(f"{os.getpid()}\n")
 
-    for name, field, value in (("SIGUSR1", "held", True), ("SIGUSR2", "held", False),
-                               ("SIGINT", "stopping", True), ("SIGTERM", "stopping", True),
-                               ("SIGHUP", "stopping", True)):
-        sig = getattr(signal, name, None)  # Windows has neither SIGUSR nor SIGHUP
+    for signame, field, value in (("SIGUSR1", "held", True), ("SIGUSR2", "held", False),
+                                  ("SIGINT", "stopping", True), ("SIGTERM", "stopping", True),
+                                  ("SIGHUP", "stopping", True)):
+        sig = getattr(signal, signame, None)  # Windows has neither SIGUSR nor SIGHUP
         if sig is not None:
             signal.signal(sig, lambda *_, f=field, v=value: setattr(sup, f, v))
 
-    sup.log(
-        f"{name or 'no'} sensor ({SCALE_NAME.get(scale, '?')}) · pause {pause}°C · resume {resume}°C · "
-        + (f"pid {pgid}" if child else f"attached to {args.attach}")
-    )
+    target = f"pid {pgid}" if child else f"attached to {args.attach}"
+    if reader is None:
+        sup.log(f"no sensor - running ungated, nothing will be frozen · {target}")
+    else:
+        sup.log(
+            f"{name} sensor ({SCALE_NAME[scale]}) · pause {pause:g}°C · resume {resume:g}°C · {target}"
+        )
     held_before = False
     rc = 0
     try:
@@ -708,14 +711,14 @@ exit codes: the child's, or 75 stuck hot, 78 no sensor, 143 terminated.""",
             if sup.held != held_before:  # manual hold overrides the sensor
                 (sup.freeze("held") if sup.held else sup.thaw("released"))
                 held_before = sup.held
-            elif not sup.held:
-                temp = reader() if reader else None
+            elif not sup.held and reader is not None:
+                temp = reader()
                 throttled = read_throttle()
                 if args.verbose:
                     sup.log(f"{temp if temp is not None else '?'}°C{' throttled' if throttled else ''}")
                 action = gov.step(temp, throttled)
                 if action == "pause":
-                    sup.freeze(f"{temp if temp is not None else 'sensor lost'}°C")
+                    sup.freeze(f"{temp:g}°C" if temp is not None else "sensor lost")
                 elif action == "resume":
                     sup.thaw(f"{temp}°C")
 
