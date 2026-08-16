@@ -23,6 +23,12 @@ state() { ps -o stat= -p "$1" 2>/dev/null | cut -c1; }
 $T -- sh -c 'exit 3' >/dev/null 2>&1
 check "child exit code passthrough" "$?" "3"
 
+$T -- sh -c 'kill -9 $$' >/dev/null 2>&1
+check "child killed by SIGKILL reports 137" "$?" "137"
+
+$T -- sh -c 'kill -TERM $$' >/dev/null 2>&1
+check "child killed by SIGTERM reports 143" "$?" "143"
+
 $T -p 50 -r 60 -- true >/dev/null 2>&1
 check "resume must be below pause" "$?" "2"
 

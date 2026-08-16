@@ -750,6 +750,8 @@ exit codes: the child's, or 75 stuck hot, 78 no sensor, 143 terminated.""",
         while not sup.stopping:
             if child is not None and child.poll() is not None:
                 rc = child.returncode
+                if rc < 0:  # killed by a signal: report it the way a shell does
+                    rc = 128 - rc
                 break
             if child is None and not alive(args.attach):
                 break
@@ -761,12 +763,13 @@ exit codes: the child's, or 75 stuck hot, 78 no sensor, 143 terminated.""",
                 temp = reader()
                 throttled = read_throttle()
                 if args.verbose:
-                    sup.log(f"{temp if temp is not None else '?'}°C{' throttled' if throttled else ''}")
+                    sup.log(f"{f'{temp:.1f}°C' if temp is not None else 'no reading'}"
+                            f"{' · throttled' if throttled else ''}")
                 action = gov.step(temp, throttled)
                 if action == "pause":
-                    sup.freeze(f"{temp:g}°C" if temp is not None else "sensor lost")
+                    sup.freeze(f"{temp:.1f}°C" if temp is not None else "sensor lost")
                 elif action == "resume":
-                    sup.thaw(f"{temp}°C")
+                    sup.thaw(f"{temp:.1f}°C")
 
             if sup.frozen_at and args.max_wait and not sup.held:
                 if time.monotonic() - sup.frozen_at > args.max_wait * 60:
