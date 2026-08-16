@@ -13,8 +13,9 @@ First release.
   a single snapshot when redirected; one line per reading with `-v`.
 - Hooks on freeze and thaw (`-o`, `-O`), manual hold via SIGUSR1/SIGUSR2,
   `--max-wait` to give up on a machine that never cools.
-- Hysteresis of two agreeing readings each way; macOS throttling counts as hot;
-  a sensor that stops answering three times running fails safe to frozen.
+- Hysteresis of two agreeing readings each way, except an OS throttle report,
+  which freezes at once; a sensor that stops answering three times running
+  fails safe to frozen.
 - Refuses to attach to a process in the calling shell's own group, refuses a
   pidfile another running thermo owns, and always thaws on every exit path.
 - Signals answered immediately rather than at the next poll; exit codes follow

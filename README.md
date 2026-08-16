@@ -112,9 +112,9 @@ a chassis reading of 37 °C means roughly what a die reading of 85 °C does.
 
 Only sensors the platform can actually have are probed. Freezing needs two
 consecutive hot readings, and thawing two cool ones, so a brief spike does not
-flap the job. macOS throttling is treated as hot on its
-own. If the sensor stops answering three times running, thermo assumes the
-worst and freezes.
+flap the job. A throttle report from the OS skips that wait - the machine is
+already slowing down, so there is nothing left to predict. If the sensor stops
+answering three times running, thermo assumes the worst and freezes.
 
 ## Limits worth knowing
 
