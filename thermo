@@ -1,0 +1,744 @@
+#!/usr/bin/env python3
+"""thermo - keep long jobs from cooking the machine.
+
+Runs a command (or attaches to one already running) and freezes it whenever the
+machine gets hot, thawing it once things cool down. Stdlib only, nothing to
+install: copy the file, chmod +x, run.
+
+The heat signal comes from whatever the OS exposes without sudo: the SMC on
+macOS, thermal zones on Linux, ACPI on Windows. Silicon temperatures (CPU, GPU)
+are what throttle; the chassis reading is what heat-soaks over a long run.
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import glob
+import os
+import re
+import shlex
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+__version__ = "1.0.0"
+
+SANE_MIN, SANE_MAX = 0.0, 120.0  # anything outside this is a bad reading
+SILICON_MIN = 10.0  # a CPU/GPU sensor reading less than this is a parked core
+DEFAULTS = {"die": (85.0, 70.0), "chassis": (37.0, 34.0)}  # pause, resume
+SCALE_NAME = {"die": "chip", "chassis": "body"}  # what the numbers mean to a human
+E_MAXWAIT, E_NOSENSOR, E_TERM = 75, 78, 143
+FREEZABLE = hasattr(os, "killpg")  # false on Windows
+
+
+def sh(argv, timeout=5):
+    """Run argv, never through a shell. Returns stdout, or None on any failure."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def sane(value):
+    return value if value is not None and SANE_MIN < value < SANE_MAX else None
+
+
+# ---- parsers (pure, unit-tested) ---------------------------------------
+def parse_ioreg(text):
+    """macOS battery pack temperature, reported in hundredths of a degree."""
+    m = re.search(r'"Temperature"\s*=\s*(\d+)', text or "")
+    return sane(int(m.group(1)) / 100) if m else None
+
+
+def parse_pmset(text):
+    """True when macOS says it is throttling or already warning about heat."""
+    text = text or ""
+    m = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", text)
+    if m and int(m.group(1)) < 100:
+        return True
+    return bool(re.search(r"thermal warning level\s*=\s*[1-9]", text, re.I))
+
+
+def parse_millidegrees(text):
+    """Linux sysfs reports temperatures in millidegrees Celsius."""
+    try:
+        return sane(int((text or "").strip()) / 1000)
+    except ValueError:
+        return None
+
+
+def parse_powermetrics(text):
+    """Highest 'X die temperature: NN.N C' line, if powermetrics ran as root."""
+    temps = [float(v) for v in re.findall(r"die temperature:\s*([\d.]+)\s*C", text or "")]
+    return sane(max(temps)) if temps else None
+
+
+def parse_wmi(text):
+    """Windows ACPI zones report tenths of a Kelvin."""
+    tenths = [int(v) for v in re.findall(r"\b(\d{4,5})\b", text or "")]
+    temps = [sane(t / 10 - 273.15) for t in tenths]
+    temps = [t for t in temps if t is not None]
+    return max(temps) if temps else None
+
+
+# ---- sensors -----------------------------------------------------------
+def read_ioreg():
+    return parse_ioreg(sh(["ioreg", "-c", "AppleSmartBattery", "-r"]))
+
+
+# ---- Apple SMC temperature sensors -------------------------------------
+# Apple Silicon reports no temperature to powermetrics or ioreg. The SMC does,
+# without root, and it labels its sensors: Tp* are CPU cores, Tg* the GPU, TB*
+# the battery. That is where the CPU/GPU split comes from - the HID sensor
+# services expose the same silicon under opaque names (tdie1, tdev3) that
+# cannot be attributed to either.
+#
+# The protocol is a fixed struct passed to one IOKit selector. Any failure at
+# any step means "no reading", and the next sensor in the chain takes over.
+SMC_SELECTOR = 2  # kSMCHandleYPCEvent
+SMC_READ_BYTES, SMC_READ_INDEX, SMC_READ_KEYINFO = 5, 8, 9
+SMC_GROUPS = {"cpu": "Tp", "gpu": "Tg", "chassis": "TB"}
+# SMC type tag -> (byte width, struct format, divisor). Other types are skipped.
+SMC_TYPES = {"flt ": (4, "<f", 1.0), "sp78": (2, ">h", 256.0), "ioft": (8, "<Q", 65536.0)}
+_SMC = {"open": False, "conn": None, "io": None, "keys": ()}
+
+
+class _SMCKeyData(ctypes.Structure):
+    """The one struct the SMC user client takes, laid out as IOKit expects it."""
+
+    class _Vers(ctypes.Structure):
+        _fields_ = [("major", ctypes.c_uint8), ("minor", ctypes.c_uint8), ("build", ctypes.c_uint8),
+                    ("reserved", ctypes.c_uint8), ("release", ctypes.c_uint16)]
+
+    class _PLimit(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint16), ("length", ctypes.c_uint16), ("cpu", ctypes.c_uint32),
+                    ("gpu", ctypes.c_uint32), ("mem", ctypes.c_uint32)]
+
+    class _KeyInfo(ctypes.Structure):
+        _fields_ = [("dataSize", ctypes.c_uint32), ("dataType", ctypes.c_uint32),
+                    ("dataAttributes", ctypes.c_uint8)]
+
+    _fields_ = [("key", ctypes.c_uint32), ("vers", _Vers), ("pLimit", _PLimit), ("keyInfo", _KeyInfo),
+                ("result", ctypes.c_uint8), ("status", ctypes.c_uint8), ("data8", ctypes.c_uint8),
+                ("data32", ctypes.c_uint32), ("bytes", ctypes.c_uint8 * 32)]
+
+
+def _smc_open():
+    """Open the SMC once and cache the keys worth polling. None when unavailable."""
+    if _SMC["open"] is not False:
+        return _SMC["open"]
+    _SMC["open"] = None
+    if sys.platform != "darwin":
+        return None
+    try:
+        io = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+        libc = ctypes.CDLL("/usr/lib/libSystem.dylib")
+        io.IOServiceMatching.restype = ctypes.c_void_p
+        io.IOServiceGetMatchingService.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        io.IOServiceOpen.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                                     ctypes.POINTER(ctypes.c_uint32)]
+        io.IOConnectCallStructMethod.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+                                                 ctypes.c_size_t, ctypes.c_void_p,
+                                                 ctypes.POINTER(ctypes.c_size_t)]
+        libc.mach_task_self.restype = ctypes.c_uint32
+
+        service = io.IOServiceGetMatchingService(0, io.IOServiceMatching(b"AppleSMC"))
+        conn = ctypes.c_uint32()
+        if not service or io.IOServiceOpen(service, libc.mach_task_self(), 0, ctypes.byref(conn)):
+            return None
+        _SMC.update(open=True, conn=conn.value, io=io)
+        _SMC["keys"] = tuple(_smc_probe_keys())
+    except Exception:  # any ctypes, symbol or struct-layout problem
+        _SMC["open"] = None
+    return _SMC["open"]
+
+
+def _smc_call(request):
+    """Send one struct to the SMC user client. None on any non-zero result."""
+    out = _SMCKeyData()
+    size = ctypes.c_size_t(ctypes.sizeof(_SMCKeyData))
+    rc = _SMC["io"].IOConnectCallStructMethod(
+        _SMC["conn"], SMC_SELECTOR, ctypes.byref(request), ctypes.sizeof(_SMCKeyData),
+        ctypes.byref(out), ctypes.byref(size),
+    )
+    return out if rc == 0 else None
+
+
+def _smc_read(key, size):
+    """Raw bytes of one key, or None."""
+    request = _SMCKeyData(key=key, data8=SMC_READ_BYTES)
+    request.keyInfo.dataSize = size
+    out = _smc_call(request)
+    return bytes(out.bytes[:size]) if out else None
+
+
+def _smc_probe_keys():
+    """The SMC holds thousands of keys; find the temperature ones just once.
+
+    Size and type are cached alongside each key, which halves the work per poll:
+    a reading becomes one round trip instead of an info lookup plus a read.
+    """
+    total = _smc_read(struct.unpack(">I", b"#KEY")[0], 4)
+    for index in range(struct.unpack(">I", total)[0] if total else 0):
+        found = _smc_call(_SMCKeyData(data8=SMC_READ_INDEX, data32=index))
+        if not found or struct.pack(">I", found.key)[:2].decode(errors="replace") not in SMC_GROUPS.values():
+            continue
+        info = _smc_call(_SMCKeyData(key=found.key, data8=SMC_READ_KEYINFO))
+        if not info:
+            continue
+        dtype = struct.pack(">I", info.keyInfo.dataType).decode(errors="replace")
+        if SMC_TYPES.get(dtype, (None,))[0] == info.keyInfo.dataSize:
+            yield struct.pack(">I", found.key).decode(errors="replace"), found.key, dtype
+
+
+def read_smc_sensors():
+    """{key name: °C} for the CPU, GPU and battery sensors. Empty when unavailable."""
+    if not _smc_open():
+        return {}
+    out = {}
+    try:
+        for name, key, dtype in _SMC["keys"]:
+            size, fmt_, divisor = SMC_TYPES[dtype]
+            raw = _smc_read(key, size)
+            value = sane(struct.unpack(fmt_, raw)[0] / divisor) if raw else None
+            if value is not None:
+                out[name] = value
+    except Exception:  # a sensor vanishing mid-run is not fatal
+        pass
+    return out
+
+
+def group_sensors(readings):
+    """{group: (max, mean)} for cpu, gpu and chassis. Pure, so it is testable.
+
+    Idle cores are power-gated and report a few degrees rather than a real
+    temperature. Those readings are ignored while any live one remains, so they
+    cannot drag the average down and make a warm machine look cool. If the whole
+    group is parked, its readings are used as they are - a cold answer beats no
+    answer, and the governor is gated on the hottest group anyway.
+    """
+    groups = {}
+    for group, prefix in SMC_GROUPS.items():
+        values = [v for k, v in readings.items() if k.startswith(prefix) and sane(v) is not None]
+        if group != "chassis":
+            values = [v for v in values if v >= SILICON_MIN] or values
+        groups[group] = (max(values), sum(values) / len(values)) if values else (None, None)
+    return groups
+
+
+def read_smc():
+    """Hottest silicon sensor - CPU or GPU, whichever is closer to throttling."""
+    groups = group_sensors(read_smc_sensors())
+    hot = [v for v in (groups["cpu"][0], groups["gpu"][0]) if v is not None]
+    return max(hot) if hot else None
+
+
+def read_sysfs():
+    temps = []
+    for path in glob.glob("/sys/class/thermal/thermal_zone*/temp") + glob.glob(
+        "/sys/class/hwmon/*/temp*_input"
+    ):
+        try:
+            with open(path) as fh:
+                temps.append(parse_millidegrees(fh.read()))
+        except OSError:
+            continue
+    temps = [t for t in temps if t is not None]
+    return max(temps) if temps else None
+
+
+def read_powermetrics():
+    return parse_powermetrics(sh(["powermetrics", "--samplers", "smc", "-n", "1"], timeout=15))
+
+
+def read_wmi():
+    return parse_wmi(
+        sh(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance -Namespace root/wmi "
+                "-ClassName MSAcpi_ThermalZoneTemperature).CurrentTemperature",
+            ],
+            timeout=15,
+        )
+    )
+
+
+def read_throttle():
+    """Fast, coarse heat signal on macOS; unavailable elsewhere."""
+    return parse_pmset(sh(["pmset", "-g", "therm"])) if sys.platform == "darwin" else False
+
+
+def read_fans():
+    """Fan speeds in RPM. Linux only - macOS does not expose them without root."""
+    rpm = []
+    for path in glob.glob("/sys/class/hwmon/*/fan*_input"):
+        try:
+            with open(path) as fh:
+                rpm.append(int(fh.read().strip()))
+        except (OSError, ValueError):
+            continue
+    return sorted(r for r in rpm if r > 0)
+
+
+# name -> (reader, scale). Probed in this order when --sensor is not given;
+# powermetrics needs root, so it is opt-in only.
+SENSORS = {
+    "smc": (read_smc, "die"),
+    "sysfs": (read_sysfs, "die"),
+    "ioreg": (read_ioreg, "chassis"),
+    "wmi": (read_wmi, "die"),
+    "powermetrics": (read_powermetrics, "die"),
+}
+AUTO = {"darwin": ("smc", "ioreg"), "win32": ("wmi",)}.get(sys.platform, ("sysfs",))
+
+
+def pick_sensor(name):
+    """Return (name, reader, scale) for the first sensor that gives a reading."""
+    for candidate in [name] if name else AUTO:
+        reader, scale = SENSORS[candidate]
+        if reader() is not None:
+            return candidate, reader, scale
+    return None, None, None
+
+
+# ---- policy (pure, unit-tested) ----------------------------------------
+class Governor:
+    """Decides when to freeze and when to thaw.
+
+    Two gaps stop it flapping: the pause/resume threshold gap, and a run of
+    consecutive agreeing readings before either transition. A sensor that
+    stops answering is treated as hot, so a broken probe fails safe.
+    """
+
+    def __init__(self, pause, resume, streak=2, max_fails=3):
+        self.pause, self.resume = pause, resume
+        self.streak, self.max_fails = streak, max_fails
+        self.frozen = False
+        self.hot = self.cool = self.fails = 0
+
+    def step(self, temp, throttled=False):
+        """Feed one reading (temp None = read failed). Returns 'pause'|'resume'|None."""
+        if temp is None:
+            self.fails += 1
+            if self.fails < self.max_fails:
+                return None
+            # the run of failed reads is itself the evidence - freeze on this one
+            self.hot = self.streak - 1
+            hot, cool = True, False
+        else:
+            self.fails = 0
+            hot = throttled or temp >= self.pause
+            cool = not throttled and temp <= self.resume
+
+        self.hot = self.hot + 1 if hot else 0
+        self.cool = self.cool + 1 if cool else 0
+
+        if not self.frozen and self.hot >= self.streak:
+            self.frozen, self.hot = True, 0
+            return "pause"
+        if self.frozen and self.cool >= self.streak:
+            self.frozen, self.cool = False, 0
+            return "resume"
+        return None
+
+
+# ---- supervision -------------------------------------------------------
+class Supervisor:
+    def __init__(self, args, pgid, child=None):
+        self.args, self.pgid, self.child = args, pgid, child
+        self.held = False  # SIGUSR1 hold, released by SIGUSR2
+        self.stopping = False
+        self.frozen_at = None
+
+    def log(self, msg):
+        print(f"thermo: {msg}", file=sys.stderr, flush=True)
+
+    def hook(self, cmd):
+        if not cmd:
+            return
+        try:
+            subprocess.run(shlex.split(cmd), timeout=10)
+        except (OSError, subprocess.SubprocessError, ValueError) as err:
+            self.log(f"hook failed: {err}")
+
+    def signal_group(self, sig):
+        if not FREEZABLE:
+            return False
+        try:
+            os.killpg(self.pgid, sig)
+            return True
+        except OSError:
+            return False
+
+    def freeze(self, why):
+        self.frozen_at = time.monotonic()
+        if not self.signal_group(signal.SIGSTOP) and not self.args.on_pause:
+            self.log("cannot freeze on this platform - use -o/--on-pause")
+        self.hook(self.args.on_pause)
+        self.log(f"paused ({why})")
+
+    def thaw(self, why):
+        self.hook(self.args.on_resume)
+        self.signal_group(signal.SIGCONT)
+        waited = int(time.monotonic() - (self.frozen_at or time.monotonic()))
+        self.frozen_at = None
+        self.log(f"resumed ({why}) after {waited}s")
+
+    def stop_child(self):
+        """Always thaw first: a frozen process cannot act on SIGTERM."""
+        self.signal_group(signal.SIGCONT)
+        if self.child is None:  # attached: release it, never kill it
+            return
+        self.signal_group(signal.SIGTERM)
+        try:
+            self.child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.signal_group(signal.SIGKILL)
+
+
+def sample(sensor):
+    """One reading of everything available: CPU, GPU, chassis, fans, throttle.
+
+    Only the SMC separates CPU from GPU. Elsewhere there is a single silicon
+    reading; it goes in the CPU slot so the display keeps one shape.
+    """
+    blank = (None, None)  # (max, mean)
+    cpu = gpu = chassis = blank
+    if sensor == "smc":
+        groups = group_sensors(read_smc_sensors())
+        cpu, gpu, chassis = groups["cpu"], groups["gpu"], groups["chassis"]
+    elif sensor == "powermetrics":
+        cpu = (read_powermetrics(), None)
+    elif sensor == "wmi":
+        cpu = (read_wmi(), None)
+    elif sensor == "sysfs":
+        cpu = (read_sysfs(), None)
+    if chassis[0] is None and sys.platform == "darwin":
+        chassis = (read_ioreg(), None)
+
+    silicon = [t for t in (cpu[0], gpu[0]) if t is not None]
+    return {
+        "cpu": cpu,
+        "gpu": gpu,
+        "die": max(silicon) if silicon else None,  # what the governor gates on
+        "chassis": sane(chassis[0]),
+        "fans": read_fans(),
+        "throttled": read_throttle(),
+    }
+
+
+def is_hot(reading, scale, pause):
+    """The one definition of too hot: at the threshold, or the OS already throttling."""
+    temp = reading[scale]
+    return reading["throttled"] or (temp is not None and temp >= pause)
+
+
+def fmt(temp):
+    return f"{temp:5.1f} °C" if temp is not None else "    -   "
+
+
+def temp_row(group):
+    """'42.6 °C max   38.7 °C avg' - the max is what throttles, the avg what monitors show."""
+    hottest, mean = group
+    if hottest is None:
+        return fmt(None)
+    return f"{fmt(hottest)} max" + (f"   {fmt(mean)} avg" if mean is not None else "")
+
+
+def status(name, scale, pause, resume, interval, plain):
+    """No job to supervise: show what thermo sees.
+
+    A terminal gets a live screen that refreshes until 'q'; anything else (a
+    pipe, a log file, or -v) gets one plain line per reading instead.
+    """
+    if not name:
+        print("sensor   none available")
+        return E_NOSENSOR
+
+    live = not plain and FREEZABLE and sys.stdin.isatty() and sys.stdout.isatty()
+    if not live and not plain:  # piped or redirected: one snapshot, then exit
+        s = sample(name)
+        hot = is_hot(s, scale, pause)
+        print(f"sensor          {name} ({SCALE_NAME[scale]})")
+        for label in ("cpu", "gpu"):
+            if s[label][0] is not None:
+                print(f"{label.upper():<15} {temp_row(s[label])}")
+        print(f"body (chassis)  {fmt(s['chassis']).strip()}")
+        if s["fans"]:
+            print(f"fans            {'  '.join(f'{r} rpm' for r in s['fans'])}")
+        print(f"throttle        {'yes' if s['throttled'] else 'no'}")
+        print(f"would           {'freeze' if hot else 'run'} (pause {pause:g} / resume {resume:g})")
+        return 0
+
+    lo = hi = None
+    started = time.monotonic()
+    restore = None
+    if live:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        restore = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        sys.stdout.write("\033[?25l")  # hide cursor
+
+    try:
+        while True:
+            s = sample(name)
+            temp = s[scale]
+            if temp is not None:
+                lo = temp if lo is None else min(lo, temp)
+                hi = temp if hi is None else max(hi, temp)
+            verdict = "FREEZE" if is_hot(s, scale, pause) else "run"
+            fans = "  ".join(f"{r} rpm" for r in s["fans"])
+
+            if not live:
+                print(
+                    f"{time.strftime('%H:%M:%S')}  {fmt(temp)}"
+                    + (f"  {fans}" if fans else "")
+                    + ("  throttled" if s["throttled"] else ""),
+                    flush=True,
+                )
+            else:
+                secs = int(time.monotonic() - started)
+                elapsed = (
+                    f"{secs // 3600}:{secs // 60 % 60:02d}:{secs % 60:02d}"
+                    if secs >= 3600
+                    else f"{secs // 60:02d}:{secs % 60:02d}"
+                )
+                sys.stdout.write(
+                    "\033[H\033[J"
+                    f"thermo · {name} sensor ({SCALE_NAME[scale]}) · {time.strftime('%H:%M:%S')} · elapsed {elapsed}\n\n"
+                    + "".join(
+                        f"  {label.upper():<15} {temp_row(s[label])}\n"
+                        for label in ("cpu", "gpu")
+                        if s[label][0] is not None
+                    )
+                    + 
+                    f"  body (chassis)  {fmt(s['chassis'])}\n"
+                    f"  fans            {fans or '-'}\n"
+                    f"  throttle        {'YES' if s['throttled'] else 'no'}\n"
+                    f"  hottest range   {fmt(lo)} .. {fmt(hi)}\n\n"
+                    f"  verdict         {verdict}  (pause {pause:g} / resume {resume:g})\n\n"
+                    "  q quit\n"
+                )
+                sys.stdout.flush()
+
+            if live:
+                import select
+
+                if select.select([sys.stdin], [], [], interval)[0]:
+                    if sys.stdin.read(1).lower() == "q":
+                        return 0
+            else:
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        if restore is not None:
+            import termios
+
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, restore)
+            sys.stdout.write("\033[?25h")  # show cursor
+            sys.stdout.flush()
+
+
+class Waker:
+    """A pipe signal handlers write to, so a wait ends the moment a signal lands.
+
+    Python resumes an interrupted sleep (PEP 475), so a plain time.sleep() would
+    hold Ctrl-C for a whole poll interval. Selecting on this pipe instead makes
+    the response immediate.
+    """
+
+    def __init__(self):
+        self.read_fd, self.write_fd = os.pipe()
+        for fd in (self.read_fd, self.write_fd):
+            os.set_blocking(fd, False)
+        signal.set_wakeup_fd(self.write_fd)
+
+    def wait(self, seconds):
+        """Sleep, but return early when a signal arrives."""
+        import select
+
+        try:
+            ready, _, _ = select.select([self.read_fd], [], [], seconds)
+        except (OSError, ValueError):
+            time.sleep(seconds)
+            return
+        if ready:
+            try:
+                os.read(self.read_fd, 4096)
+            except OSError:
+                pass
+
+    def close(self):
+        signal.set_wakeup_fd(-1)
+        for fd in (self.read_fd, self.write_fd):
+            os.close(fd)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="thermo",
+        usage="thermo [options] -- command ...\n       thermo [options] -a PID\n       thermo [-v]  (show current readings)",
+        description="Freeze a job while the machine is hot; thaw it when it cools.",
+        epilog="""examples:
+  thermo                                     watch temperatures, q to quit
+  thermo -- npm run build                    gate any command
+  thermo -p 80 -r 65 -- python train.py      custom thresholds
+  thermo -o 'ollama stop qwen3:27b' -- job    drop the model while frozen
+  thermo -a 4242 -f /tmp/thermo.pid          gate a process already running
+
+signals:
+  kill -USR1 $(cat /tmp/thermo.pid)          hold frozen
+  kill -USR2 $(cat /tmp/thermo.pid)          release the hold
+
+exit codes: the child's, or 75 stuck hot, 78 no sensor, 143 terminated.""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("-V", "--version", action="version", version=f"thermo {__version__}")
+    ap.add_argument("-p", "--pause", type=float, help="freeze at or above this °C")
+    ap.add_argument("-r", "--resume", type=float, help="thaw at or below this °C")
+    ap.add_argument("-i", "--interval", type=float, help="seconds between readings")
+    ap.add_argument("-a", "--attach", type=int, metavar="PID", help="gate a running process")
+    ap.add_argument("-o", "--on-pause", metavar="CMD", help="run on freeze")
+    ap.add_argument("-O", "--on-resume", metavar="CMD", help="run on thaw")
+    ap.add_argument("-w", "--max-wait", type=float, default=0, help="minutes hot before giving up")
+    ap.add_argument("-f", "--pidfile", help="write thermo's own pid here")
+    ap.add_argument("-s", "--sensor", choices=sorted(SENSORS), help="force a sensor")
+    ap.add_argument("-u", "--ungated", action="store_true", help="run even with no sensor")
+    ap.add_argument("-v", "--verbose", action="store_true", help="log every reading")
+    ap.add_argument("command", nargs=argparse.REMAINDER)
+    args = ap.parse_args(argv)
+
+    cmd = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if cmd and args.attach:
+        ap.error("give a command after -- or a pid with -a, not both")
+
+    name, reader, scale = pick_sensor(args.sensor)
+    d_pause, d_resume = DEFAULTS[scale or "chassis"]
+    pause = args.pause if args.pause is not None else d_pause
+    resume = args.resume if args.resume is not None else d_resume
+    if resume >= pause:
+        ap.error("--resume must be below --pause")
+    if not SANE_MIN < pause < SANE_MAX:
+        ap.error(f"--pause must be between {SANE_MIN:g} and {SANE_MAX:g} °C")
+    if args.interval is not None and args.interval <= 0:
+        ap.error("--interval must be greater than zero")
+    if args.max_wait < 0:
+        ap.error("--max-wait cannot be negative")
+
+    if not cmd and not args.attach:  # nothing to supervise: just report
+        # A screen wants to feel live; a supervised job does not need the churn.
+        return status(name, scale, pause, resume, args.interval or 1, args.verbose)
+    interval = args.interval or 10
+    if not name and not args.ungated:
+        print("thermo: no usable temperature sensor (-s to force, -u to run ungated)", file=sys.stderr)
+        return E_NOSENSOR
+
+    if args.attach:
+        if not alive(args.attach):
+            print(f"thermo: no such process {args.attach}", file=sys.stderr)
+            return 1
+        try:
+            pgid, child = os.getpgid(args.attach), None
+        except OSError as err:  # it exited between the check and here
+            print(f"thermo: cannot attach to {args.attach}: {err}", file=sys.stderr)
+            return 1
+        # Freezing our own group would freeze thermo and the shell that started
+        # it, with nothing left running to thaw them.
+        if pgid <= 1 or pgid == os.getpgrp():
+            print(
+                f"thermo: pid {args.attach} shares this shell's process group - "
+                "start it with `thermo -- ...` or in its own session instead",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        try:  # own session, so signals reach the whole job tree, not just the parent
+            child = subprocess.Popen(cmd, start_new_session=True)
+        except OSError as err:
+            print(f"thermo: cannot run {cmd[0]}: {err}", file=sys.stderr)
+            return 127
+        pgid = child.pid
+
+    sup = Supervisor(args, pgid, child)
+    gov = Governor(pause, resume)
+    waker = Waker()
+    if args.pidfile:
+        with open(args.pidfile, "w") as fh:
+            fh.write(f"{os.getpid()}\n")
+
+    for name, field, value in (("SIGUSR1", "held", True), ("SIGUSR2", "held", False),
+                               ("SIGINT", "stopping", True), ("SIGTERM", "stopping", True),
+                               ("SIGHUP", "stopping", True)):
+        sig = getattr(signal, name, None)  # Windows has neither SIGUSR nor SIGHUP
+        if sig is not None:
+            signal.signal(sig, lambda *_, f=field, v=value: setattr(sup, f, v))
+
+    sup.log(
+        f"{name or 'no'} sensor ({SCALE_NAME.get(scale, '?')}) · pause {pause}°C · resume {resume}°C · "
+        + (f"pid {pgid}" if child else f"attached to {args.attach}")
+    )
+    held_before = False
+    rc = 0
+    try:
+        while not sup.stopping:
+            if child is not None and child.poll() is not None:
+                rc = child.returncode
+                break
+            if child is None and not alive(args.attach):
+                break
+
+            if sup.held != held_before:  # manual hold overrides the sensor
+                (sup.freeze("held") if sup.held else sup.thaw("released"))
+                held_before = sup.held
+            elif not sup.held:
+                temp = reader() if reader else None
+                throttled = read_throttle()
+                if args.verbose:
+                    sup.log(f"{temp if temp is not None else '?'}°C{' throttled' if throttled else ''}")
+                action = gov.step(temp, throttled)
+                if action == "pause":
+                    sup.freeze(f"{temp if temp is not None else 'sensor lost'}°C")
+                elif action == "resume":
+                    sup.thaw(f"{temp}°C")
+
+            if sup.frozen_at and args.max_wait and not sup.held:
+                if time.monotonic() - sup.frozen_at > args.max_wait * 60:
+                    sup.log(f"still hot after {args.max_wait} min - stopping")
+                    sup.stop_child()
+                    return E_MAXWAIT
+            waker.wait(interval)
+
+        if sup.stopping:
+            sup.stop_child()
+            return E_TERM
+        return rc
+    finally:
+        waker.close()
+        sup.signal_group(signal.SIGCONT)  # never leave anything frozen
+        if args.pidfile:
+            try:
+                os.unlink(args.pidfile)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
