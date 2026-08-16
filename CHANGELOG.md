@@ -15,10 +15,14 @@ First release.
   `--max-wait` to give up on a machine that never cools.
 - Hysteresis of two agreeing readings each way; macOS throttling counts as hot;
   a sensor that stops answering three times running fails safe to frozen.
-- Refuses to attach to a process in the calling shell's own group, and always
-  thaws on every exit path.
+- Refuses to attach to a process in the calling shell's own group, refuses a
+  pidfile another running thermo owns, and always thaws on every exit path.
+- Signals answered immediately rather than at the next poll; exit codes follow
+  the shell convention (130 SIGINT, 143 SIGTERM, 75 stuck hot, 78 no sensor).
 
 Known limits: freezing does not cancel an in-flight request, only stops new
 ones; Windows reads temperatures and runs hooks but cannot freeze; fan speeds
-are Linux-only. Verified on macOS 15 (Apple M4 Max); the Linux and Windows
-sensor paths are covered by unit tests but have not been run on real hardware.
+are Linux-only; two thermo runs gating the same process will fight over it.
+Verified on macOS 15 (Apple M4 Max). The Linux readers are tested against a
+fake /sys tree and the Windows one against captured output, but neither has run
+on real hardware.

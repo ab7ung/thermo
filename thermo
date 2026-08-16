@@ -29,7 +29,8 @@ SANE_MIN, SANE_MAX = 0.0, 120.0  # anything outside this is a bad reading
 SILICON_MIN = 10.0  # a CPU/GPU sensor reading less than this is a parked core
 DEFAULTS = {"die": (85.0, 70.0), "chassis": (37.0, 34.0)}  # pause, resume
 SCALE_NAME = {"die": "chip", "chassis": "body"}  # what the numbers mean to a human
-E_MAXWAIT, E_NOSENSOR, E_TERM = 75, 78, 143
+E_MAXWAIT, E_NOSENSOR = 75, 78
+E_INT, E_TERM = 130, 143  # 128 + signal number, as a shell reports it
 FREEZABLE = hasattr(os, "killpg")  # false on Windows
 
 
@@ -269,9 +270,18 @@ def read_wmi():
     )
 
 
+_THROTTLE = {"at": 0.0, "value": False}
+THROTTLE_TTL = 5.0  # seconds; pmset is a subprocess, and this flag moves slowly
+
+
 def read_throttle():
-    """Fast, coarse heat signal on macOS; unavailable elsewhere."""
-    return parse_pmset(sh(["pmset", "-g", "therm"])) if sys.platform == "darwin" else False
+    """Whether macOS is throttling. Cached briefly - elsewhere always False."""
+    if sys.platform != "darwin":
+        return False
+    now = time.monotonic()
+    if now - _THROTTLE["at"] >= THROTTLE_TTL:
+        _THROTTLE.update(at=now, value=parse_pmset(sh(["pmset", "-g", "therm"])))
+    return _THROTTLE["value"]
 
 
 def read_fans():
@@ -335,6 +345,9 @@ class Governor:
             self.fails = 0
             hot = throttled or temp >= self.pause
             cool = not throttled and temp <= self.resume
+            if throttled:
+                # not a prediction: the OS is already slowing the machine down
+                self.hot = self.streak - 1
 
         self.hot = self.hot + 1 if hot else 0
         self.cool = self.cool + 1 if cool else 0
@@ -354,6 +367,7 @@ class Supervisor:
         self.args, self.pgid, self.child = args, pgid, child
         self.held = False  # SIGUSR1 hold, released by SIGUSR2
         self.stopping = False
+        self.stop_code = E_TERM
         self.frozen_at = None
 
     def log(self, msg):
@@ -584,6 +598,29 @@ class Waker:
             os.close(fd)
 
 
+def write_pidfile(path):
+    """Claim the pidfile, refusing to displace a thermo that is still running.
+
+    A crashed run leaves the file behind, so a pid that no longer exists - or
+    belongs to something else entirely - is treated as stale and replaced.
+    """
+    try:
+        with open(path) as fh:
+            other = int(fh.read().strip())
+        if other != os.getpid() and alive(other):
+            print(f"thermo: {path} belongs to pid {other}, which is still running", file=sys.stderr)
+            return False
+    except (OSError, ValueError):
+        pass  # missing, unreadable or garbage: ours to claim
+    try:
+        with open(path, "w") as fh:
+            fh.write(f"{os.getpid()}\n")
+    except OSError as err:
+        print(f"thermo: cannot write {path}: {err}", file=sys.stderr)
+        return False
+    return True
+
+
 def alive(pid):
     try:
         os.kill(pid, 0)
@@ -680,16 +717,25 @@ exit codes: the child's, or 75 stuck hot, 78 no sensor, 143 terminated.""",
     sup = Supervisor(args, pgid, child)
     gov = Governor(pause, resume)
     waker = Waker()
-    if args.pidfile:
-        with open(args.pidfile, "w") as fh:
-            fh.write(f"{os.getpid()}\n")
+    if args.pidfile and not write_pidfile(args.pidfile):
+        return 1
 
-    for signame, field, value in (("SIGUSR1", "held", True), ("SIGUSR2", "held", False),
-                                  ("SIGINT", "stopping", True), ("SIGTERM", "stopping", True),
-                                  ("SIGHUP", "stopping", True)):
+    def on_signal(field, value, code=None):
+        def handler(*_):
+            setattr(sup, field, value)
+            if code is not None:
+                sup.stop_code = code
+
+        return handler
+
+    for signame, handler in (("SIGUSR1", on_signal("held", True)),
+                             ("SIGUSR2", on_signal("held", False)),
+                             ("SIGINT", on_signal("stopping", True, E_INT)),
+                             ("SIGTERM", on_signal("stopping", True, E_TERM)),
+                             ("SIGHUP", on_signal("stopping", True, E_TERM))):
         sig = getattr(signal, signame, None)  # Windows has neither SIGUSR nor SIGHUP
         if sig is not None:
-            signal.signal(sig, lambda *_, f=field, v=value: setattr(sup, f, v))
+            signal.signal(sig, handler)
 
     target = f"pid {pgid}" if child else f"attached to {args.attach}"
     if reader is None:
@@ -731,15 +777,17 @@ exit codes: the child's, or 75 stuck hot, 78 no sensor, 143 terminated.""",
 
         if sup.stopping:
             sup.stop_child()
-            return E_TERM
+            return sup.stop_code
         return rc
     finally:
         waker.close()
         sup.signal_group(signal.SIGCONT)  # never leave anything frozen
         if args.pidfile:
             try:
-                os.unlink(args.pidfile)
-            except OSError:
+                with open(args.pidfile) as fh:
+                    if int(fh.read().strip()) == os.getpid():
+                        os.unlink(args.pidfile)
+            except (OSError, ValueError):
                 pass
 
 

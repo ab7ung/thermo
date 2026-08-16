@@ -132,6 +132,8 @@ worst and freezes.
   drop with it (37/34 instead of 85/70).
 - **Windows has no SIGSTOP.** Temperatures are read and hooks still run, but
   nothing is actually frozen.
+- **Two thermo runs gating the same process will fight** over freeze and thaw.
+  Use one, and `-f` to keep track of it.
 - thermo never kills a process it did not start.
 
 ## Tests
@@ -144,8 +146,9 @@ make cli      # real processes, signals, exit codes
 
 ## Status
 
-Verified on macOS 15 (Apple M4 Max). The Linux and Windows sensor readers are
-unit-tested against captured output but have not yet run on real hardware -
-reports welcome. See CHANGELOG.md for what shipped.
+Verified on macOS 15 (Apple M4 Max). The Linux readers run in the test suite
+against a fake `/sys` tree and the Windows one against captured output, but
+neither has been exercised on real hardware - reports welcome. See
+CHANGELOG.md.
 
 MIT licensed.

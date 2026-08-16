@@ -91,6 +91,24 @@ kid=$(pgrep -P "$hg" | head -1)
 check "ungated keeps running" "$(state "$kid")" "S"
 kill "$hg"
 
+# one owner per pidfile; a stale one is fair game
+nohup $T -i 5 -f /tmp/thermo-own.pid -- sleep 20 >/dev/null 2>&1 </dev/null &
+sleep 2
+$T -f /tmp/thermo-own.pid -- true >/dev/null 2>&1
+check "refuses a live pidfile" "$?" "1"
+kill "$(cat /tmp/thermo-own.pid)" 2>/dev/null
+sleep 2
+echo 999999 > /tmp/thermo-own.pid
+$T -f /tmp/thermo-own.pid -- true >/dev/null 2>&1
+check "claims a stale pidfile" "$?" "0"
+
+# SIGINT reports 130, SIGTERM 143 - what a shell would report
+nohup $T -i 5 -f /tmp/thermo-int.pid -- sleep 20 >/dev/null 2>&1 </dev/null &
+sleep 2
+kill -INT "$(cat /tmp/thermo-int.pid)"
+wait $! 2>/dev/null
+check "SIGINT exit code" "$?" "130"
+
 # stuck hot: give up, stop the job, exit 75
 $T -i 1 -p 5 -r 4 -w 0.05 -- sleep 30 >/dev/null 2>&1
 check "--max-wait exit code" "$?" "75"

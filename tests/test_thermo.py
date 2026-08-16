@@ -1,11 +1,14 @@
-"""Unit tests for thermo's pure parts: the parsers and the governor.
+"""Unit tests: parsers, sensor grouping, the Linux readers and the governor.
 
-The supervisor itself is exercised by tests/test_cli.sh, which needs real
-processes and signals.
+The Linux readers run against a fake /sys tree, so that path is covered on any
+platform. The supervisor itself needs real processes and signals and lives in
+tests/test_cli.sh.
 """
 import importlib.machinery
 import importlib.util
 import pathlib
+import shutil
+import tempfile
 import unittest
 
 _path = pathlib.Path(__file__).resolve().parent.parent / "thermo"
@@ -77,6 +80,49 @@ class SmcGrouping(unittest.TestCase):
         self.assertEqual(t.group_sensors({"Tp01": 2.1, "Tp05": 2.3})["cpu"], (2.3, 2.2))
 
 
+class LinuxReaders(unittest.TestCase):
+    """read_sysfs/read_fans against a fake /sys tree, so the Linux path runs anywhere."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.real_glob = t.glob.glob
+        t.glob.glob = lambda pattern: self.real_glob(self.tmp + pattern)
+        self.addCleanup(setattr, t.glob, "glob", self.real_glob)
+
+    def write(self, relative, text):
+        path = pathlib.Path(self.tmp) / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def test_hottest_thermal_zone_wins(self):
+        self.write("sys/class/thermal/thermal_zone0/temp", "41000\n")
+        self.write("sys/class/thermal/thermal_zone1/temp", "58500\n")
+        self.assertAlmostEqual(t.read_sysfs(), 58.5)
+
+    def test_hwmon_inputs_counted_too(self):
+        self.write("sys/class/hwmon/hwmon2/temp1_input", "72000\n")
+        self.assertAlmostEqual(t.read_sysfs(), 72.0)
+
+    def test_unreadable_and_absurd_zones_skipped(self):
+        self.write("sys/class/thermal/thermal_zone0/temp", "not a number")
+        self.write("sys/class/thermal/thermal_zone1/temp", "999000")
+        self.write("sys/class/thermal/thermal_zone2/temp", "39000")
+        self.assertAlmostEqual(t.read_sysfs(), 39.0)
+
+    def test_no_zones_at_all(self):
+        self.assertIsNone(t.read_sysfs())
+
+    def test_fan_speeds_sorted_and_zeroes_dropped(self):
+        self.write("sys/class/hwmon/hwmon0/fan1_input", "3200\n")
+        self.write("sys/class/hwmon/hwmon0/fan2_input", "0\n")
+        self.write("sys/class/hwmon/hwmon1/fan1_input", "1800\n")
+        self.assertEqual(t.read_fans(), [1800, 3200])
+
+    def test_no_fans(self):
+        self.assertEqual(t.read_fans(), [])
+
+
 class HotRule(unittest.TestCase):
     def reading(self, temp=50.0, throttled=False):
         return {"die": temp, "chassis": temp, "throttled": throttled}
@@ -124,9 +170,9 @@ class GovernorPolicy(unittest.TestCase):
         self.assertEqual(g.step(69), "resume")
         self.assertFalse(g.frozen)
 
-    def test_throttle_flag_freezes_regardless_of_temp(self):
+    def test_throttle_flag_freezes_at_once(self):
+        # no streak: the OS is already throttling, that is not a prediction
         g = self.gov()
-        g.step(30, throttled=True)
         self.assertEqual(g.step(30, throttled=True), "pause")
 
     def test_throttle_flag_blocks_thaw(self):
